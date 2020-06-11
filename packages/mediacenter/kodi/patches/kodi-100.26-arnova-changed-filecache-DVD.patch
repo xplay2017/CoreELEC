@@ -1,0 +1,260 @@
+From 50baa13be988436663af8e1b13b3d5ce454e9414 Mon Sep 17 00:00:00 2001
+From: From: arnova <arnova@void.org>
+Date: Thu, 11 Jun 2020 19:33:10 +0800
+Subject: [PATCH] changed: Move filecache buffering logic from
+ CDVDInputStreamFile to CFile #17046
+
+---
+ .../DVDInputStreams/DVDInputStreamFile.cpp         | 29 +-------
+ xbmc/filesystem/File.cpp                           | 85 +++++++++++++---------
+ 2 files changed, 54 insertions(+), 60 deletions(-)
+
+diff --git a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamFile.cpp b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamFile.cpp
+index 0918433..d01a3e6 100644
+--- a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamFile.cpp
++++ b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamFile.cpp
+@@ -7,13 +7,11 @@
+  */
+ 
+ #include "DVDInputStreamFile.h"
+-#include "ServiceBroker.h"
++
+ #include "filesystem/File.h"
+ #include "filesystem/IFile.h"
+-#include "settings/AdvancedSettings.h"
+-#include "settings/SettingsComponent.h"
+-#include "utils/log.h"
+ #include "utils/URIUtils.h"
++#include "utils/log.h"
+ 
+ using namespace XFILE;
+ 
+@@ -49,29 +47,6 @@ bool CDVDInputStreamFile::Open()
+   if (!m_item.IsSubtitle())
+     flags |= READ_AUDIO_VIDEO;
+ 
+-  /*
+-   * There are 5 buffer modes available (configurable in as.xml)
+-   * 0) Buffer all internet filesystems (like 2 but additionally also ftp, webdav, etc.) (default)
+-   * 1) Buffer all filesystems (including local)
+-   * 2) Only buffer true internet filesystems (streams) (http, etc.)
+-   * 3) No buffer
+-   * 4) Buffer all non-local (remote) filesystems
+-   */
+-  if (!URIUtils::IsOnDVD(m_item.GetDynPath()) && !URIUtils::IsBluray(m_item.GetDynPath())) // Never cache these
+-  {
+-    unsigned int iCacheBufferMode = CServiceBroker::GetSettingsComponent()->GetAdvancedSettings()->m_cacheBufferMode;
+-    if ((iCacheBufferMode == CACHE_BUFFER_MODE_INTERNET && URIUtils::IsInternetStream(m_item.GetDynPath(), true))
+-     || (iCacheBufferMode == CACHE_BUFFER_MODE_TRUE_INTERNET && URIUtils::IsInternetStream(m_item.GetDynPath(), false))
+-     || (iCacheBufferMode == CACHE_BUFFER_MODE_REMOTE && URIUtils::IsRemote(m_item.GetDynPath()))
+-     || (iCacheBufferMode == CACHE_BUFFER_MODE_ALL))
+-    {
+-      flags |= READ_CACHED;
+-    }
+-  }
+-
+-  if (!(flags & READ_CACHED))
+-    flags |= READ_NO_CACHE; // Make sure CFile honors our no-cache hint
+-
+   std::string content = m_item.GetMimeType();
+ 
+   if (content == "video/mp4" ||
+diff --git a/xbmc/filesystem/File.cpp b/xbmc/filesystem/File.cpp
+index 5402816..6b10dbb 100644
+--- a/xbmc/filesystem/File.cpp
++++ b/xbmc/filesystem/File.cpp
+@@ -9,21 +9,25 @@
+  */
+ 
+ #include "File.h"
+-#include "IFile.h"
+-#include "FileFactory.h"
++
+ #include "Application.h"
+-#include "DirectoryCache.h"
+ #include "Directory.h"
++#include "DirectoryCache.h"
+ #include "FileCache.h"
++#include "FileFactory.h"
++#include "IFile.h"
+ #include "PasswordManager.h"
+-#include "system.h"
+-#include "utils/log.h"
+-#include "utils/URIUtils.h"
+-#include "utils/BitstreamStats.h"
++#include "ServiceBroker.h"
+ #include "Util.h"
++#include "commons/Exception.h"
++#include "settings/AdvancedSettings.h"
++#include "settings/SettingsComponent.h"
++#include "utils/BitstreamStats.h"
+ #include "utils/StringUtils.h"
++#include "utils/URIUtils.h"
++#include "utils/log.h"
+ 
+-#include "commons/Exception.h"
++#include "system.h"
+ 
+ using namespace XFILE;
+ 
+@@ -110,9 +114,9 @@ bool CFile::Copy(const CURL& url2, const CURL& dest, XFILE::IFileCallback* pCall
+           else if (strDirectory[0] == pathsep[0])
+             strCurrPath += pathsep;
+ 
+-          for (std::vector<std::string>::iterator iter = tokens.begin(); iter != tokens.end(); ++iter)
++          for (const std::string& iter : tokens)
+           {
+-            strCurrPath += *iter + pathsep;
++            strCurrPath += iter + pathsep;
+             CDirectory::Create(strCurrPath);
+           }
+         }
+@@ -281,23 +285,40 @@ bool CFile::Open(const CURL& file, const unsigned int flags)
+         return false;
+     }
+ 
++    /*
++    * There are 5 buffer modes available (configurable in as.xml)
++    * 0) Buffer all internet filesystems (like 2 but additionally also ftp, webdav, etc.)
++    * 1) Buffer all filesystems (including local)
++    * 2) Only buffer true internet filesystems (streams) (http, etc.)
++    * 3) No buffer
++    * 4) Buffer all remote (non-local) filesystems
++    */
+     if (!(m_flags & READ_NO_CACHE))
+     {
+-      const std::string pathToUrl(url.Get());
+-      if (URIUtils::IsInternetStream(url, true) && !CUtil::IsPicture(pathToUrl) )
+-        m_flags |= READ_CACHED;
+-
+-      if (m_flags & READ_CACHED)
++      const std::string pathToUrl(file.Get());
++      if ((m_flags & READ_AUDIO_VIDEO) || URIUtils::IsDVD(pathToUrl) || URIUtils::IsBluray(pathToUrl))
+       {
+-        // for internet stream, if it contains multiple stream, file cache need handle it specially.
+-        m_pFile = new CFileCache(m_flags);
++        const unsigned int iCacheBufferMode = CServiceBroker::GetSettingsComponent()->GetAdvancedSettings()->m_cacheBufferMode;
++        if ((iCacheBufferMode == CACHE_BUFFER_MODE_INTERNET && URIUtils::IsInternetStream(pathToUrl, true))
++        || (iCacheBufferMode == CACHE_BUFFER_MODE_TRUE_INTERNET && URIUtils::IsInternetStream(pathToUrl, false))
++        || (iCacheBufferMode == CACHE_BUFFER_MODE_REMOTE && URIUtils::IsRemote(pathToUrl))
++        || (iCacheBufferMode == CACHE_BUFFER_MODE_ALL))
++        {
++          m_flags |= READ_CACHED;
++        }
++      }
++    }
+ 
+-        if (!m_pFile)
+-          return false;
++    if (m_flags & READ_CACHED)
++    {
++      m_pFile = new CFileCache(m_flags);
+ 
+-        return m_pFile->Open(url);
+-      }
++      if (!m_pFile)
++        return false;
++
++      return m_pFile->Open(url);
+     }
++
+     m_pFile = CFileFactory::CreateLoader(url);
+ 
+     if (!m_pFile)
+@@ -327,7 +348,7 @@ bool CFile::Open(const CURL& file, const unsigned int flags)
+         m_pFile = pRedirectEx->m_pNewFileImp;
+         delete pRedirectEx;
+ 
+-        if (pNewUrl.get())
++        if (pNewUrl)
+         {
+           CURL newAuthUrl(*pNewUrl);
+           if (CPasswordManager::GetInstance().IsURLSupported(newAuthUrl) && newAuthUrl.GetUserName().empty())
+@@ -438,7 +459,7 @@ bool CFile::Exists(const CURL& file, bool bUseCache /* = true */)
+     }
+ 
+     std::unique_ptr<IFile> pFile(CFileFactory::CreateLoader(url));
+-    if (!pFile.get())
++    if (!pFile)
+       return false;
+ 
+     return pFile->Exists(authUrl);
+@@ -455,9 +476,9 @@ bool CFile::Exists(const CURL& file, bool bUseCache /* = true */)
+       std::unique_ptr<CURL> pNewUrl(pRedirectEx->m_pNewUrl);
+       delete pRedirectEx;
+ 
+-      if (pImp.get())
++      if (pImp)
+       {
+-        if (pNewUrl.get())
++        if (pNewUrl)
+         {
+           if (bUseCache)
+           {
+@@ -522,7 +543,7 @@ int CFile::Stat(const CURL& file, struct __stat64* buffer)
+   try
+   {
+     std::unique_ptr<IFile> pFile(CFileFactory::CreateLoader(url));
+-    if (!pFile.get())
++    if (!pFile)
+       return -1;
+     return pFile->Stat(authUrl, buffer);
+   }
+@@ -538,9 +559,9 @@ int CFile::Stat(const CURL& file, struct __stat64* buffer)
+       std::unique_ptr<CURL> pNewUrl(pRedirectEx->m_pNewUrl);
+       delete pRedirectEx;
+ 
+-      if (pNewUrl.get())
++      if (pNewUrl)
+       {
+-        if (pImp.get())
++        if (pImp)
+         {
+           CURL newAuthUrl = *pNewUrl;
+           if (CPasswordManager::GetInstance().IsURLSupported(newAuthUrl) && newAuthUrl.GetUserName().empty())
+@@ -662,7 +683,6 @@ void CFile::Close()
+   {
+     CLog::Log(LOGERROR, "%s - Unhandled exception", __FUNCTION__);
+   }
+-  return;
+ }
+ 
+ void CFile::Flush()
+@@ -677,7 +697,6 @@ void CFile::Flush()
+   {
+     CLog::Log(LOGERROR, "%s - Unhandled exception", __FUNCTION__);
+   }
+-  return;
+ }
+ 
+ //*********************************************************************************************
+@@ -870,7 +889,7 @@ bool CFile::Delete(const CURL& file)
+       CPasswordManager::GetInstance().AuthenticateURL(authUrl);
+ 
+     std::unique_ptr<IFile> pFile(CFileFactory::CreateLoader(url));
+-    if (!pFile.get())
++    if (!pFile)
+       return false;
+ 
+     if(pFile->Delete(authUrl))
+@@ -911,7 +930,7 @@ bool CFile::Rename(const CURL& file, const CURL& newFile)
+       CPasswordManager::GetInstance().AuthenticateURL(authUrlNew);
+ 
+     std::unique_ptr<IFile> pFile(CFileFactory::CreateLoader(url));
+-    if (!pFile.get())
++    if (!pFile)
+       return false;
+ 
+     if(pFile->Rename(authUrl, authUrlNew))
+@@ -946,7 +965,7 @@ bool CFile::SetHidden(const CURL& file, bool hidden)
+       CPasswordManager::GetInstance().AuthenticateURL(authUrl);
+ 
+     std::unique_ptr<IFile> pFile(CFileFactory::CreateLoader(url));
+-    if (!pFile.get())
++    if (!pFile)
+       return false;
+ 
+     return pFile->SetHidden(authUrl, hidden);
+-- 
+2.7.4
+
